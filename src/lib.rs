@@ -11,62 +11,78 @@ pub enum Arg<'a> {
     Pos(&'a str)
 }
 pub enum ParseHint {
-    Next,
     ExpectParameter
 }
 #[derive(Debug)]
 pub enum ParseError<'a> {
-    MissingParameter(&'a str)
+    MissingParameter(&'a str),
+    UnexpectedParameter(&'a str, &'a str)
 }
 impl<'a> ParseState<'a> {
-    pub fn parse(self, arg: &'a str, mut cb: impl FnMut(Arg) -> ParseHint) -> ParseState<'a> {
+    pub fn parse(self, arg: &'a str, mut cb: impl FnMut(Arg<'a>) -> Option<ParseHint>) -> Result<ParseState<'a>, ParseError> {
+        if arg.len() == 0 {
+            return Ok(self)
+        }
+
         match self {
             ParseState::Void => {
                 let mut chars = arg.chars();
-                let (arg_text, arg_type) = if chars.next() == Some('-') {
+                if chars.next() == Some('-') {
                     match chars.next() {
-                        Some('-') => if arg.len() == 2 { return ParseState::ForcePos } else { (&arg[2..], Arg::Opt(&arg[2..])) },
-                        Some(_) => return ParseState::Combo.parse(&arg[1..], cb),
-                        None => (arg, Arg::Pos(arg)),
+                        Some('-') if arg.len() == 2 => Ok(ParseState::ForcePos),
+                        Some('-') => {
+                            if let Some(split_pos) = arg.find('=') {
+                                let opt = &arg[2..split_pos];
+                                let par = &arg[split_pos+1..];
+                                match cb(Arg::Opt(opt)) {
+                                    None => Err(ParseError::UnexpectedParameter(opt, par)),
+                                    Some(ParseHint::ExpectParameter) => { cb(Arg::OptPar(opt, par)); Ok(ParseState::Void) }
+                                }
+                            } else {
+                                match cb(Arg::Opt(&arg[2..])) {
+                                    None => Ok(ParseState::Void),
+                                    Some(ParseHint::ExpectParameter) => Ok(ParseState::Parameter(&arg[2..]))
+                                }
+                            }
+                        },
+                        Some(_) => ParseState::Combo.parse(&arg[1..], cb),
+                        None => { cb(Arg::Pos(arg)); Ok(ParseState::Void) },
                     }
                 } else {
-                    (arg, Arg::Pos(arg))
-                };
-                let hint = cb(arg_type);
-                match hint {
-                    ParseHint::Next => ParseState::Void,
-                    ParseHint::ExpectParameter => ParseState::Parameter(arg_text)
+                    cb(Arg::Pos(arg));
+                    Ok(ParseState::Void)
                 }
             },
             ParseState::Combo => {
                 let hint = cb(Arg::Opt(&arg[0..1]));
 
-                if arg.len() == 1 {
-                    match hint {
-                        ParseHint::Next => if arg.len() == 1 { ParseState::Void } else { ParseState::Combo.parse(&arg[1..], cb) },
-                        ParseHint::ExpectParameter => ParseState::Parameter(&arg[0..1])
-                    }
-                } else {
-                    match hint {
-                        ParseHint::Next => ParseState::Combo.parse(&arg[1..], cb),
-                        ParseHint::ExpectParameter => ParseState::Parameter(&arg[0..1]).parse(&arg[1..], cb)
-                    }
+                match (hint, arg.len()) {
+                    (None, 1) => if arg.len() == 1 { Ok(ParseState::Void) } else { ParseState::Combo.parse(&arg[1..], cb) },
+                    (Some(ParseHint::ExpectParameter), 1) => Ok(ParseState::Parameter(&arg[0..1])),
+                    (None, _) => ParseState::Combo.parse(&arg[1..], cb),
+                    (Some(ParseHint::ExpectParameter), _) => ParseState::Parameter(&arg[0..1]).parse(&arg[1..], cb)
                 }
             }
             ParseState::Parameter(opt) => {
-                cb(Arg::OptPar(opt, arg));
-                ParseState::Void 
+                if let Some(split_pos) = opt.find('=') {
+                    cb(Arg::OptPar(&opt[..split_pos], &opt[split_pos+1..]));
+                    ParseState::Void.parse(arg, cb)
+
+                } else {
+                    cb(Arg::OptPar(opt, arg));
+                    Ok(ParseState::Void) 
+                }
             },
             ParseState::ForcePos => {
                 cb(Arg::Pos(arg));
-                ParseState::Void 
+                Ok(ParseState::Void)
             }
         }
     }
 }
 
-pub fn parse<'a>(args: &'a [&str], mut cb: impl FnMut(Arg) -> ParseHint) -> Result<(), ParseError<'a>> {
-    let end_state = args.iter().fold(ParseState::Void, move |state, arg| state.parse(arg, &mut cb));
+pub fn parse<'a>(args: &'a [&str], mut cb: impl FnMut(Arg<'a>) -> Option<ParseHint>) -> Result<(), ParseError<'a>> {
+    let end_state = args.iter().try_fold(ParseState::Void, move |state, arg| state.parse(arg, &mut cb))?;
     match end_state {
         ParseState::Void | ParseState::ForcePos => Ok(()),
         ParseState::Parameter(opt) => Err(ParseError::MissingParameter(opt)),
@@ -81,7 +97,7 @@ mod tests {
     fn positional() {
         parse(&["filename"], |arg| {
             match arg {
-                Arg::Pos("filename") => ParseHint::Next,
+                Arg::Pos("filename") => None,
                 a @ _ => panic!("Invalid parameter {:?}", a)
             }
         }).expect("Parse error");
@@ -90,7 +106,7 @@ mod tests {
     fn help() {
         parse(&["--help"], |arg| {
             match arg {
-                Arg::Opt("help") => ParseHint::Next,
+                Arg::Opt("help") => None,
                 a @ _ => panic!("Invalid parameter {:?}", a)
             }
         }).expect("Parse error");
@@ -99,10 +115,10 @@ mod tests {
     fn parameter() {
         parse(&["--foo", "bar"], |arg| {
             match arg {
-                Arg::Opt("foo") => ParseHint::ExpectParameter,
+                Arg::Opt("foo") => Some(ParseHint::ExpectParameter),
                 Arg::OptPar("foo", arg) => {
                     assert!(arg == "bar");
-                    ParseHint::Next
+                    None
                 }
                 a @ _ => panic!("Invalid parameter {:?}", a)
             }
@@ -114,9 +130,9 @@ mod tests {
         let mut got_c = false;
         parse(&["-abc"], |arg| {
             match arg {
-                Arg::Opt("a") => { got_a = true; ParseHint::Next },
-                Arg::Opt("b") => { got_b = true; ParseHint::Next },
-                Arg::Opt("c") => { got_c = true; ParseHint::Next },
+                Arg::Opt("a") => { got_a = true; None },
+                Arg::Opt("b") => { got_b = true; None },
+                Arg::Opt("c") => { got_c = true; None },
                 a @ _ => panic!("Invalid parameter {:?}", a)
             }
         }).expect("Parse error");
@@ -129,10 +145,10 @@ mod tests {
         let mut got_c = false;
         parse(&["-abc", "foo"], |arg| {
             match arg {
-                Arg::Opt("a") => { got_a = true; ParseHint::Next },
-                Arg::Opt("b") => { got_b = true; ParseHint::Next },
-                Arg::Opt("c") => { ParseHint::ExpectParameter },
-                Arg::OptPar("c", "foo") => { got_c = true; ParseHint::Next },
+                Arg::Opt("a") => { got_a = true; None },
+                Arg::Opt("b") => { got_b = true; None },
+                Arg::Opt("c") => { Some(ParseHint::ExpectParameter) },
+                Arg::OptPar("c", "foo") => { got_c = true; None },
                 a @ _ => panic!("Invalid parameter {:?}", a)
             }
         }).expect("Parse error");
@@ -145,10 +161,10 @@ mod tests {
         let mut got_c = false;
         parse(&["-abcfoo"], |arg| {
             match arg {
-                Arg::Opt("a") => { got_a = true; ParseHint::Next },
-                Arg::Opt("b") => { got_b = true; ParseHint::Next },
-                Arg::Opt("c") => { ParseHint::ExpectParameter },
-                Arg::OptPar("c", "foo") => { got_c = true; ParseHint::Next },
+                Arg::Opt("a") => { got_a = true; None },
+                Arg::Opt("b") => { got_b = true; None },
+                Arg::Opt("c") => { Some(ParseHint::ExpectParameter) },
+                Arg::OptPar("c", "foo") => { got_c = true; None },
                 a @ _ => panic!("Invalid parameter {:?}", a)
             }
         }).expect("Parse error");
@@ -160,22 +176,26 @@ mod tests {
         let mut got_b = false;
         let mut got_foobar = false;
         let mut c = None;
+        let mut bag = None;
         let mut pos = vec![];
 
-        let params = &["foo", "-abcfoo", "bar", "--foobar", "--", "--baz"];
+        let params = &["--bag=bad", "foo", "-abcfoo", "bar", "--foobar", "--", "--baz"];
         parse(params, |arg| {
+            let mut hint = None;
             match arg {
-                Arg::Opt("a") => { got_a = true; ParseHint::Next },
-                Arg::Opt("b") => { got_b = true; ParseHint::Next },
-                Arg::Opt("c") => { ParseHint::ExpectParameter },
-                Arg::Opt("foobar") => { got_foobar = true; ParseHint::Next },
-                Arg::OptPar("c", value) => { c = Some(value.to_string()); ParseHint::Next },
-                Arg::Pos(value) => { pos.push(value.to_string()); ParseHint::Next },
+                Arg::Opt("a") => got_a = true,
+                Arg::Opt("b") => got_b = true,
+                Arg::Opt("c") | Arg::Opt("bag") => hint = Some(ParseHint::ExpectParameter),
+                Arg::Opt("foobar") => got_foobar = true,
+                Arg::OptPar("c", value) => c = Some(value),
+                Arg::OptPar("bag", value) => bag = Some(value),
+                Arg::Pos(value) => pos.push(value),
                 a @ _ => panic!("Invalid parameter {:?}", a)
-            }
+            };
+            hint
         }).expect("Parse error");
-        assert!(got_a && got_b && c == Some("foo".to_string()) &&
-                got_foobar &&
+        assert!(got_a && got_b && c == Some("foo") &&
+                got_foobar && bag == Some("bad") &&
                 pos[0] == "foo" && pos[1] == "bar" && pos[2] == "--baz");
     }
 }

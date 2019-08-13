@@ -11,10 +11,12 @@ pub enum Arg<'a> {
     Pos(&'a str)
 }
 pub enum ParseHint {
+    InvalidOption,
     ExpectParameter
 }
 #[derive(Debug)]
 pub enum ParseError<'a> {
+    InvalidOption(&'a str),
     MissingParameter(&'a str),
     UnexpectedParameter(&'a str, &'a str)
 }
@@ -36,12 +38,14 @@ impl<'a> ParseState<'a> {
                                 let par = &arg[split_pos+1..];
                                 match cb(Arg::Opt(opt)) {
                                     None => Err(ParseError::UnexpectedParameter(opt, par)),
-                                    Some(ParseHint::ExpectParameter) => { cb(Arg::OptPar(opt, par)); Ok(ParseState::Void) }
+                                    Some(ParseHint::ExpectParameter) => { cb(Arg::OptPar(opt, par)); Ok(ParseState::Void) },
+                                    Some(ParseHint::InvalidOption) => Err(ParseError::InvalidOption(opt))
                                 }
                             } else {
                                 match cb(Arg::Opt(&arg[2..])) {
                                     None => Ok(ParseState::Void),
-                                    Some(ParseHint::ExpectParameter) => Ok(ParseState::Parameter(&arg[2..]))
+                                    Some(ParseHint::ExpectParameter) => Ok(ParseState::Parameter(&arg[2..])),
+                                    Some(ParseHint::InvalidOption) => Err(ParseError::InvalidOption(&arg[2..]))
                                 }
                             }
                         },
@@ -60,7 +64,8 @@ impl<'a> ParseState<'a> {
                     (None, 1) => if arg.len() == 1 { Ok(ParseState::Void) } else { ParseState::Combo.parse(&arg[1..], cb) },
                     (Some(ParseHint::ExpectParameter), 1) => Ok(ParseState::Parameter(&arg[0..1])),
                     (None, _) => ParseState::Combo.parse(&arg[1..], cb),
-                    (Some(ParseHint::ExpectParameter), _) => ParseState::Parameter(&arg[0..1]).parse(&arg[1..], cb)
+                    (Some(ParseHint::ExpectParameter), _) => ParseState::Parameter(&arg[0..1]).parse(&arg[1..], cb),
+                    (Some(ParseHint::InvalidOption), _) => Err(ParseError::InvalidOption(&arg[0..1]))
                 }
             }
             ParseState::Parameter(opt) => {
@@ -82,8 +87,22 @@ impl<'a> ParseState<'a> {
 }
 
 pub fn parse<'a>(args: &'a [&str], mut cb: impl FnMut(Arg<'a>) -> Option<ParseHint>) -> Result<(), ParseError<'a>> {
-    let end_state = args.iter().try_fold(ParseState::Void, move |state, arg| state.parse(arg, &mut cb))?;
-    match end_state {
+    match args.iter().try_fold(ParseState::Void, move |state, arg| state.parse(arg, &mut cb))? {
+        ParseState::Void | ParseState::ForcePos => Ok(()),
+        ParseState::Parameter(opt) => Err(ParseError::MissingParameter(opt)),
+        ParseState::Combo => panic!("In combo state after parse!")
+    }
+}
+
+pub fn parse_string_vec<'a>(args: &'a Vec<String>, mut cb: impl FnMut(Arg<'a>) -> Option<ParseHint>) -> Result<(), ParseError<'a>> {
+    match args.iter().try_fold(ParseState::Void, move |state, arg| state.parse(arg, &mut cb))? {
+        ParseState::Void | ParseState::ForcePos => Ok(()),
+        ParseState::Parameter(opt) => Err(ParseError::MissingParameter(opt)),
+        ParseState::Combo => panic!("In combo state after parse!")
+    }
+}
+pub fn parse_string_iterator<'a>(mut args: impl Iterator<Item=&'a String>, mut cb: impl FnMut(Arg<'a>) -> Option<ParseHint>) -> Result<(), ParseError<'a>> {
+    match args.try_fold(ParseState::Void, move |state, arg| state.parse(arg, &mut cb))? {
         ParseState::Void | ParseState::ForcePos => Ok(()),
         ParseState::Parameter(opt) => Err(ParseError::MissingParameter(opt)),
         ParseState::Combo => panic!("In combo state after parse!")
